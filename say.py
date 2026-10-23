@@ -33,8 +33,14 @@ PROMPT = """Подготовь текст статьи к озвучиванию
   «100 долларов»).
 - Таблицы и списки перескажи связными фразами, проговаривая заголовок столбца
   перед значением, чтобы было понятно на слух.
+- Цитаты — чужие слова, приведённые дословно (выступления, документы,
+  высказывания других людей), — выдели в отдельные абзацы и начни каждый такой
+  абзац с маркера [ЦИТАТА] и пробела. Если абзац уже начинается с [ЦИТАТА],
+  сохрани маркер. Авторский текст маркером не помечай.
 - Абзацы разделяй пустой строкой. Не добавляй ничего от себя, никаких
   вступлений и комментариев. Верни только готовый текст."""
+
+QUOTE = "[ЦИТАТА]"
 
 
 def load_env():
@@ -86,7 +92,7 @@ def extract_url(url):
             continue
         if el.name.startswith("h") and not txt.endswith((".", "!", "?", ":")):
             txt += "."
-        parts.append(txt)
+        parts.append(f"{QUOTE} {txt}" if el.name == "blockquote" else txt)
     return title, "\n\n".join(parts)
 
 
@@ -237,19 +243,45 @@ def tts_yandex(chunk, path, voice):
 
 
 ENGINES = {"edge": (tts_edge, 3000), "yandex": (tts_yandex, 4900)}
+DEFAULT_VOICE = {"edge": "ru-RU-SvetlanaNeural", "yandex": "alena"}
+# голос цитат — противоположный по полу основному
+OTHER_VOICE = {"ru-RU-SvetlanaNeural": "ru-RU-DmitryNeural", "ru-RU-DmitryNeural": "ru-RU-SvetlanaNeural",
+               "alena": "filipp", "jane": "filipp", "omazh": "filipp",
+               "filipp": "alena", "ermil": "alena", "zahar": "alena"}
 
 
-def synth(text, out, engine, voice):
+def voice_runs(text):
+    """Разбить текст на прогоны подряд идущих абзацев: [(цитата?, текст без маркера)]."""
+    runs = []
+    for para in re.split(r"\n\s*\n", text.strip()):
+        is_quote = para.lstrip().startswith(QUOTE)
+        para = para.replace(QUOTE, "").strip()
+        if not para:
+            continue
+        if runs and runs[-1][0] == is_quote:
+            runs[-1] = (is_quote, runs[-1][1] + "\n\n" + para)
+        else:
+            runs.append((is_quote, para))
+    return runs
+
+
+def synth(text, out, engine, voice, quote_voice=True):
     fn, limit = ENGINES[engine]
-    chunks = split(text, limit)
+    voice = voice or DEFAULT_VOICE[engine]
+    quote = OTHER_VOICE.get(voice, voice) if quote_voice else voice
+    jobs = [(c, quote if q else voice) for q, run in voice_runs(text) for c in split(run, limit)]
+    n_quotes = sum(v != voice for _, v in jobs)
+    if n_quotes:
+        print(f"  цитаты: {n_quotes} кусков голосом {quote}", flush=True)
     with tempfile.TemporaryDirectory() as tmp:
-        files = [Path(tmp) / f"{i:04}.mp3" for i in range(len(chunks))]
+        files = [Path(tmp) / f"{i:04}.mp3" for i in range(len(jobs))]
 
         def one(i):
+            chunk, v = jobs[i]
             for attempt in range(3):
                 try:
-                    fn(chunks[i], files[i], voice)
-                    print(f"  {engine}: кусок {i + 1}/{len(chunks)}", flush=True)
+                    fn(chunk, files[i], v)
+                    print(f"  {engine}: кусок {i + 1}/{len(jobs)}", flush=True)
                     return
                 except Exception as e:
                     if attempt == 2:
@@ -258,7 +290,7 @@ def synth(text, out, engine, voice):
 
         # куски синтезируются параллельно, порядок задаёт список files
         with ThreadPoolExecutor(int(os.environ.get("TTS_THREADS", "4"))) as pool:
-            list(pool.map(one, range(len(chunks))))
+            list(pool.map(one, range(len(jobs))))
         concat(files, out, Path(tmp))
 
 
@@ -288,6 +320,10 @@ def selftest():
     assert split("а" * 1200, 500) and all(len(c) <= 500 for c in split("а" * 1200, 500))
     c = basic_clean("см. https://x.ru/a ## **Важно** — sponsr.ru/crim/39071 —\n\n------")
     assert "http" not in c and "sponsr" not in c and "--" not in c and "#" not in c, c
+    r = voice_runs(f"Автор раз.\n\nАвтор два.\n\n{QUOTE} Цитата раз.\n\n{QUOTE} Цитата два.\n\nАвтор три.")
+    assert r == [(False, "Автор раз.\n\nАвтор два."), (True, "Цитата раз.\n\nЦитата два."),
+                 (False, "Автор три.")], r
+    assert QUOTE in basic_clean(f"{QUOTE} текст"), "простая чистка съела маркер"
     print("selftest ok")
 
 
@@ -299,6 +335,7 @@ def main():
                                     "yandex: alena, filipp, ermil, jane, omazh, zahar")
     ap.add_argument("--no-llm", action="store_true", help="без LLM, только простая чистка")
     ap.add_argument("--text-only", action="store_true", help="только подготовить .txt")
+    ap.add_argument("--no-quote-voice", action="store_true", help="цитаты тем же голосом")
     ap.add_argument("--out", default=str(ROOT / "out"))
     ap.add_argument("--selftest", action="store_true")
     a = ap.parse_args()
@@ -307,10 +344,10 @@ def main():
     if not a.source:
         ap.error("укажите источник")
     load_env()
-    run(a.source, Path(a.out), a.tts, a.voice, a.no_llm, a.text_only)
+    run(a.source, Path(a.out), a.tts, a.voice, a.no_llm, a.text_only, not a.no_quote_voice)
 
 
-def run(source, out_dir, tts="edge", voice=None, no_llm=False, text_only=False):
+def run(source, out_dir, tts="edge", voice=None, no_llm=False, text_only=False, quote_voice=True):
     """Весь конвейер; возвращает (заголовок, путь к .mp3 или .txt). Используется и ботом."""
     if tts == "yandex" and not text_only and not os.environ.get("YANDEX_API_KEY"):
         sys.exit("Нет YANDEX_API_KEY в .env — см. README, раздел Yandex SpeechKit")
@@ -326,7 +363,7 @@ def run(source, out_dir, tts="edge", voice=None, no_llm=False, text_only=False):
     if text_only:
         print(f"Текст: {txt}")
         return title, txt
-    synth(text, mp3, tts, voice)
+    synth(text, mp3, tts, voice, quote_voice)
     print(f"Готово: {mp3}")
     return title, mp3
 

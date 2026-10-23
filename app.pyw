@@ -34,7 +34,7 @@ class App:
     def __init__(self, root):
         self.root, self.log_q, self.busy = root, queue.Queue(), False
         root.title("Озвучка статей")
-        root.geometry("720x520")
+        root.geometry("860x520")
         f = ttk.Frame(root, padding=10)
         f.pack(fill="both", expand=True)
 
@@ -53,6 +53,8 @@ class App:
         self.voice.pack(side="left")
         self.no_llm = tk.BooleanVar()
         ttk.Checkbutton(row, text="без чистки (быстрее)", variable=self.no_llm).pack(side="left", padx=12)
+        self.quote_voice = tk.BooleanVar(value=True)
+        ttk.Checkbutton(row, text="цитаты другим голосом", variable=self.quote_voice).pack(side="left")
 
         row2 = ttk.Frame(f)
         row2.pack(fill="x", pady=8)
@@ -101,10 +103,10 @@ class App:
         self.busy = True
         self.go.configure(state="disabled")
         self.status.configure(text="Работаю… (с чисткой 5–20 минут)")
-        threading.Thread(target=self.work, args=(raw, VOICES[self.voice.get()], self.no_llm.get()),
-                         daemon=True).start()
+        threading.Thread(target=self.work, args=(raw, VOICES[self.voice.get()], self.no_llm.get(),
+                                                 self.quote_voice.get()), daemon=True).start()
 
-    def work(self, raw, voice, no_llm):
+    def work(self, raw, voice, no_llm, quote_voice):
         old = sys.stdout
         sys.stdout = QueueWriter(self.log_q)
         result = None
@@ -113,12 +115,12 @@ class App:
             src, tmp = source_of(raw)
             try:
                 try:
-                    _, result = say.run(src, OUT, voice=voice, no_llm=no_llm)
+                    _, result = say.run(src, OUT, voice=voice, no_llm=no_llm, quote_voice=quote_voice)
                 except SystemExit as e:
                     if no_llm or not any(w in str(e).lower() for w in ("openrouter", "deepseek")):
                         raise
                     print(f"Чистка не удалась: {e}. Озвучиваю без неё.")
-                    _, result = say.run(src, OUT, voice=voice, no_llm=True)
+                    _, result = say.run(src, OUT, voice=voice, no_llm=True, quote_voice=quote_voice)
             finally:
                 if tmp:
                     os.unlink(tmp)
